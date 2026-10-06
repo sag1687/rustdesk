@@ -1,0 +1,138 @@
+# Client iOS personalizzato "Assistenza sinocloud.it" (RustDesk 1.5.0), IPA NON firmato.
+# Va nel fork di rustdesk/rustdesk, su un branch creato dal tag 1.5.0 (vedi prepara-e-avvia.sh).
+# Derivato dal job ufficiale build-rustdesk-ios di .github/workflows/flutter-build.yml (tag 1.5.0),
+# con le stesse sostituzioni di server/chiave usate da rdgen.
+name: iOS Assistenza sinocloud.it (IPA non firmato)
+
+on:
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.75"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VERSION: "1.5.0"
+  APP_NAME: "Assistenza sinocloud.it"
+  BUNDLE_ID: "it.sinocloud.assistenza"
+  SERVER_HOST: "217.154.15.27"
+  SERVER_KEY: "mXRvjv8beL8gXkSVsvDIGoMqgokWAlGEcrHU1sf9JWs="
+  URL_LINK: "https://sinocloud.it/privacy"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-ios:
+    name: build iOS ipa (unsigned)
+    runs-on: macos-latest
+    needs: [generate-bridge]
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: brew install nasm yasm
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Personalizzazione (server, chiave, nome, bundle id, icona, link)
+        shell: bash
+        run: |
+          set -euo pipefail
+          C=./libs/hbb_common/src/config.rs
+          grep -q 'rs-ny.rustdesk.com' "$C"
+          grep -q 'OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=' "$C"
+          sed -i '' -e "s|rs-ny.rustdesk.com|$SERVER_HOST|" "$C"
+          sed -i '' -e "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|$SERVER_KEY|" "$C"
+          grep -nE "RENDEZVOUS_SERVERS|RS_PUB_KEY" "$C"
+
+          P=./flutter/ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$P"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Assistenza" "$P"
+          sed -i '' -e "s|PRODUCT_BUNDLE_IDENTIFIER = com.carriez.flutterHbb;|PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;|g" ./flutter/ios/Runner.xcodeproj/project.pbxproj
+
+          # Icona: ogni PNG dell'AppIcon set viene rigenerato dalla 1024x1024 alle sue dimensioni originali.
+          SET=./flutter/ios/Runner/Assets.xcassets/AppIcon.appiconset
+          for f in "$SET"/*.png; do
+            w=$(sips -g pixelWidth "$f" | awk '/pixelWidth/{print $2}')
+            sips -s format png -z "$w" "$w" ./custom/icon-1024.png --out "$f" >/dev/null
+          done
+          cp ./custom/icon-1024.png ./flutter/assets/icon.png 2>/dev/null || true
+
+          sed -i '' -e "s|const url = 'https://rustdesk.com/';|const url = '$URL_LINK';|" ./flutter/lib/mobile/pages/settings_page.dart
+          sed -i '' -e "s|https://rustdesk.com/privacy.html|$URL_LINK|g" ./flutter/lib/mobile/pages/settings_page.dart
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          $VCPKG_ROOT/vcpkg install --triplet arm64-ios --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-ios
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: rustdesk-lib-cache-ios
+          key: aarch64-apple-ios
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Build rustdesk lib
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo build --locked --features flutter,hwcodec --release --target aarch64-apple-ios --lib
+
+      - name: Build app (no codesign)
+        shell: bash
+        run: |
+          cd flutter
+          flutter build ipa --release --no-codesign
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(ls -d flutter/build/ios/archive/Runner.xcarchive/Products/Applications/*.app | head -1)
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out && zip -qry "Assistenza-sinocloud-${VERSION}-unsigned.ipa" Payload
+          ls -la
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Assistenza-sinocloud-${{ env.VERSION }}-ios-unsigned
+          path: out/*.ipa
